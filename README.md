@@ -8,4 +8,4 @@ statistics reporting on the results.
 
 Requires:
   1. Apache Kafka to be installed on the system
-  2. the `kafka-python` pip package to be installed
+  2. the `pykafka` pip package to be installed
