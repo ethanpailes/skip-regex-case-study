@@ -1,0 +1,3 @@
+[submodule "scrape/regex"]
+	path = scrape/regex
+	url = git@github.com:ethanpailes/regex.git
