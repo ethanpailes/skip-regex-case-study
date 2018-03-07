@@ -48,6 +48,19 @@ macro_rules! regex {
     }}
 }
 
+struct Stats {
+    appends: usize,
+    isr_change_props: usize,
+}
+impl Stats {
+    fn new() -> Self {
+        Stats {
+            appends: 0,
+            isr_change_props: 0,
+        }
+    }
+}
+
 /// A little script to generate a histogram of messages published in each
 /// second.
 fn main() {
@@ -56,51 +69,70 @@ fn main() {
         .unwrap_or_else(|e| e.exit());
 
     let mut no_lines = 0;
-    let mut no_matching_lines = 0;
 
-    // let msg_line = r"\[(.*)\] TRACE Appended message set to log .* with first offset: ([0-9]*).*";
-    let msg_line = r"\[(.*)\] .* with first offset: ([0-9]*).*";
+    let append_line = r"\[(.*)\] .* with first offset: ([0-9]*).*";
+    let change_prop = r"\[(.*)\] .* scheduled task 'isr-change-propagation'.*";
 
     let skippable_re =
-        regex!(&format!("{}{}", msg_line, r"|.*"), args.flag_debug);
-    let idiomatic_re = Regex::new(msg_line).unwrap();
+        regex!(&format!("{}|{}|.*", append_line, change_prop),
+                args.flag_debug);
+
+    let idiomatic_res = vec![
+            Regex::new(append_line).unwrap(),
+            Regex::new(change_prop).unwrap(),
+        ];
+
+    let mut stats = Stats::new();
 
     let file = File::open(&args.arg_log_file).expect("cannot open log file");
     let file = BufReader::new(file);
     for line in file.lines().filter_map(|result| result.ok()) {
         no_lines += 1;
-        let data = if args.flag_standard {
-                idiomatic_re_scrape_msg(&idiomatic_re, line.as_bytes())
-            } else {
-                skippable_scrape_msg(&skippable_re, line.as_bytes())
-            };
-
-        if data.is_some() {
-            no_matching_lines += 1;
+        if args.flag_standard {
+            idiomatic_re_scrape_msg(&idiomatic_res, line.as_bytes(), &mut stats)
+        } else {
+            skippable_scrape_msg(&skippable_re, line.as_bytes(), &mut stats)
         }
+
     } 
 
-    println!("{}/{} lines match in the file", no_matching_lines, no_lines);
+    println!("{}/{} append events", stats.appends, no_lines);
+    println!("{}/{} 'isr-change-propagation' events",
+                stats.isr_change_props, no_lines);
 }
 
-fn skippable_scrape_msg<'a>(re: &Regex, line: &'a [u8])
-    -> Option<(&'a [u8], &'a [u8])>
+fn skippable_scrape_msg<'a>(re: &Regex, line: &'a [u8], stats: &mut Stats)
 {
     let caps = re.captures(line).unwrap();
-    match (caps.get(1), caps.get(2)) {
-        (Some(date), Some(thing)) => Some((date.as_bytes(), thing.as_bytes())),
-        _ => None
+
+    if caps.get(1).is_some() {
+        stats.appends += 1;
+    } else if caps.get(3).is_some() {
+        stats.isr_change_props += 1;
     }
 }
 
-fn idiomatic_re_scrape_msg<'a>(re: &Regex, line: &'a [u8])
-    -> Option<(&'a [u8], &'a [u8])>
+fn idiomatic_re_scrape_msg<'a>(res: &[Regex], line: &'a [u8], stats: &mut Stats)
 {
-    re.captures(line).and_then(|caps| {
-        match (caps.get(1), caps.get(2)) {
-            (Some(date), Some(thing)) =>
-                Some((date.as_bytes(), thing.as_bytes())),
-            _ => None
-        }
-    })
+    match res[0].captures(line) {
+        Some(caps) => 
+            match caps.get(1) {
+                Some(_) => {
+                    stats.appends += 1;
+                }
+                None => (),
+            },
+        None => (),
+    }
+
+    match res[1].captures(line) {
+        Some(caps) => 
+            match caps.get(1) {
+                Some(_) => {
+                    stats.isr_change_props += 1;
+                }
+                None => (),
+            },
+        None => (),
+    }
 }
