@@ -9,14 +9,17 @@ use regex::bytes::Regex;
 
 use std::io::{BufRead, BufReader};
 use std::fs::File;
+use std::cmp;
+use std::collections::HashMap;
 
 const USAGE: &'static str = "
-Usage: scrape [-d | -s | -t] <log-file>
+Usage: scrape [options] <log-file>
        scrape -h
 
 Options:
-    -d, --debug     Run with standard regex rather than skip regex.
-    -s, --standard  Run the filter routine written with idiomatic standard regex.
+    -v, --validate  First filter with a DFA, then apply skip regex.
+    -a, --append    Summarize the append events.
+    -n, --named     Summarize the named events.
     -h, --help      Print this help message.
 ";
 
@@ -24,8 +27,9 @@ Options:
 struct Args {
     arg_log_file: String,
 
-    flag_debug: bool,
-    flag_standard: bool,
+    flag_validate: bool,
+    flag_append: bool,
+    flag_named: bool,
 
     // docopt has a builtin help flag handler if you include it in your
     // usage message.
@@ -33,30 +37,39 @@ struct Args {
 }
 
 macro_rules! regex {
-    ($re:expr, $debug:expr) => {{
+    ($re:expr, $skip_validate:expr) => {{
         use regex::bytes::Regex;
         use regex::internal::ExecBuilder;
 
-        if $debug {
-            Regex::new($re).unwrap()
-        } else {
-            ExecBuilder::new($re)
-                .skip_backtrack().only_utf8(false).build()
+        if $skip_validate {
+            ExecBuilder::new($re).skip_backtrack()
+                .skip_validate(true)
+                .only_utf8(false).build()
                 .map(regex::bytes::Regex::from)
                 .unwrap()
+        } else {
+            Regex::new($re).unwrap()
         }
     }}
 }
 
 struct Stats {
     appends: usize,
-    isr_change_props: usize,
+    max_append_offset: usize,
+    min_append_offset: usize,
+    total_bytes_written: usize,
+    named_events: usize,
+    named_hist: HashMap<String, usize>,
 }
 impl Stats {
     fn new() -> Self {
         Stats {
             appends: 0,
-            isr_change_props: 0,
+            max_append_offset: 0,
+            min_append_offset: usize::max_value(),
+            total_bytes_written: 0,
+            named_events: 0,
+            named_hist: HashMap::new(),
         }
     }
 }
@@ -68,68 +81,85 @@ fn main() {
         .and_then(|d| d.deserialize())
         .unwrap_or_else(|e| e.exit());
 
-    let mut no_lines = 0;
+    let append_line =
+        r"^.* with first offset: ([0-9]+).*value=([0-9]+).*$";
+    let named_line = r".* scheduled task '(.+?)'.*";
 
-    let append_line = r"\[(.*)\] .* with first offset: ([0-9]*).*";
-    let change_prop = r"\[(.*)\] .* scheduled task 'isr-change-propagation'.*";
-
-    let skippable_re =
-        regex!(&format!("{}|{}|.*", append_line, change_prop),
-                args.flag_debug);
-
-    let idiomatic_res = vec![
-            Regex::new(append_line).unwrap(),
-            Regex::new(change_prop).unwrap(),
-        ];
+    let append_re = regex!(append_line, args.flag_validate);
+    let named_re = regex!(named_line, args.flag_validate);
 
     let mut stats = Stats::new();
 
     let file = File::open(&args.arg_log_file).expect("cannot open log file");
     let file = BufReader::new(file);
+    let mut no_lines = 0;
     for line in file.lines().filter_map(|result| result.ok()) {
         no_lines += 1;
-        if args.flag_standard {
-            idiomatic_re_scrape_msg(&idiomatic_res, line.as_bytes(), &mut stats)
-        } else {
-            skippable_scrape_msg(&skippable_re, line.as_bytes(), &mut stats)
+        if args.flag_append {
+            scrape_append(&append_re, line.as_bytes(), &mut stats);
         }
-
+        if args.flag_named {
+            scrape_named(&named_re, line.as_bytes(), &mut stats);
+        }
     } 
 
-    println!("{}/{} append events", stats.appends, no_lines);
-    println!("{}/{} 'isr-change-propagation' events",
-                stats.isr_change_props, no_lines);
-}
+    let p = |x| ((x as f64) / (no_lines as f64)) * 100.0;
 
-fn skippable_scrape_msg<'a>(re: &Regex, line: &'a [u8], stats: &mut Stats)
-{
-    let caps = re.captures(line).unwrap();
+    if args.flag_append {
+        println!("{}/{} ({:.2}%) append events",
+                    stats.appends, no_lines, p(stats.appends));
+        println!("{} min offset", stats.min_append_offset);
+        println!("{} max offset", stats.max_append_offset);
+        println!("{} total bytes written", stats.total_bytes_written);
+    }
 
-    if caps.get(1).is_some() {
-        stats.appends += 1;
-    } else if caps.get(3).is_some() {
-        stats.isr_change_props += 1;
+    if args.flag_named {
+        println!("{}/{} ({:.2}%) named events",
+            stats.named_events, no_lines, p(stats.named_events));
+
+        let mut hist = stats.named_hist.drain()
+            .map(|(e, n)| (n, e)).collect::<Vec<_>>();
+        hist.sort_by(|lhs, rhs| rhs.cmp(lhs));
+        let v = hist.iter().take(10).collect::<Vec<_>>();
+        for &(ref n, ref e) in v.into_iter() {
+            println!("event {} happened {} times.", e, n);
+        }
     }
 }
 
-fn idiomatic_re_scrape_msg<'a>(res: &[Regex], line: &'a [u8], stats: &mut Stats)
+fn scrape_append<'a>(re: &Regex, line: &'a [u8], stats: &mut Stats)
 {
-    match res[0].captures(line) {
+    match re.captures(line) {
         Some(caps) => 
-            match caps.get(1) {
-                Some(_) => {
+            match (caps.get(1), caps.get(2)) {
+                (Some(off), Some(nbytes)) => {
                     stats.appends += 1;
+                    let off = String::from_utf8_lossy(off.as_bytes())
+                                .parse::<usize>().unwrap();
+                    stats.max_append_offset =
+                        cmp::max(stats.max_append_offset, off);
+                    stats.min_append_offset =
+                        cmp::min(stats.min_append_offset, off);
+
+                    let nbytes = String::from_utf8_lossy(nbytes.as_bytes())
+                                .parse::<usize>().unwrap();
+                    stats.total_bytes_written += nbytes;
                 }
-                None => (),
+                (_, _) => (),
             },
         None => (),
     }
+}
 
-    match res[1].captures(line) {
+fn scrape_named(re: &Regex, line: &[u8], stats: &mut Stats) {
+    match re.captures(line) {
         Some(caps) => 
             match caps.get(1) {
-                Some(_) => {
-                    stats.isr_change_props += 1;
+                Some(name) => {
+                    stats.named_events += 1;
+                    *stats.named_hist
+                        .entry(String::from_utf8_lossy(name.as_bytes()).to_string())
+                        .or_insert(0) += 1;
                 }
                 None => (),
             },
